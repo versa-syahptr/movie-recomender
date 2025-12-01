@@ -51,6 +51,7 @@ def get_movie_details(movie_id):
                 m.overview AS overview, 
                 m.poster_url AS poster_url, 
                 m.vote_average AS rating,
+                m.popularity AS popularity,
                 date(m.release_date) as release_date,
                 COLLECT(DISTINCT g.name) AS genres,
                 COLLECT(DISTINCT comp.name) as companies,
@@ -63,7 +64,7 @@ def get_movie_details(movie_id):
             """
     return run_query(query, {"movie_id": movie_id})[0]
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=600)
 def get_random_movies(limit: int =10) -> List[Dict[str, Any]]:
     query = """
     MATCH (m:Movie)
@@ -87,39 +88,117 @@ def watch_movie(movie: Dict[str, Any]):
             MERGE (u)-[:WATCHED {watched_at: datetime()}]->(m)
             """
     run_query(query, {"user_id": user["id"], "movie_id": movie["id"]})
-    st.session_state["watch_history"].append(movie["id"])
+    st.session_state["watch_history"].append(movie)
     st.toast(f"{movie['title']} marked as watched!", icon="✅")
 
 
+@st.cache_data(ttl=10)
 def get_user_watch_history(user_id: str) -> List[str]:
+    if user_id == 0:
+        return []
     query = """
-            MATCH (u:User {id: $user_id}) -[a:WATCHED]-> (m:Movie)
-            RETURN COLLECT(DISTINCT m.id) as watchlist
+            MATCH (u:User {id: $user_id}) -[w:WATCHED]-> (m:Movie)
+            RETURN m.id AS id, m.title AS title, m.poster_url AS poster_url, m.release_date.year AS release_year
+            ORDER BY w.watched_at DESC
             """
     result = run_query_no_cache(query, {"user_id": user_id})
     if result:
-        return result[0]["watchlist"]
+        return result
     return []
 
-## ELEMENT or SECTION FUNCTION
+# ==========================================================
+# =============  Recommendations func calls  ===============
+# ==========================================================
 
-@st.dialog(title="Movie Details")
+def get_popular_movies():
+    query = """
+            MATCH (m:Movie)
+            RETURN m.id AS id, m.title AS title, m.poster_url AS poster_url, m.release_date.year AS release_year
+            ORDER BY m.popularity DESC
+            LIMIT 10;
+    """
+    return run_query(query)
+
+def recommend_by_keyword(movie_id):
+    q = """
+        MATCH (m:Movie {id: $id})-[:HAS_KEYWORD]->(k:Keyword)
+        WITH m, collect(DISTINCT k) AS keywords
+
+        MATCH (rec:Movie)-[hk:HAS_KEYWORD]->(rk:Keyword)
+        WHERE rec <> m
+        WITH m, rec, keywords, collect(DISTINCT rk) AS recKeywords
+        WITH m, rec, size([x IN recKeywords WHERE x IN keywords]) AS commonKeywords
+        WHERE commonKeywords > 0
+        RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year
+        LIMIT 10
+    """
+    
+    return run_query(q, {"id": movie_id})
+
+def recommend_by_genre(movie_id):
+    q = """
+        MATCH (m:Movie {title: "Avatar"})-[hg:HAS_GENRE]->(g:Genre)
+        WITH m, collect(DISTINCT g) AS genres
+
+        MATCH (rec:Movie)-[hg:HAS_GENRE]->(rg:Genre)
+        WHERE rec <> m
+        WITH m, rec, genres, collect(DISTINCT rg) AS recGenres
+        WITH m, rec, size([x IN recGenres WHERE x IN genres]) AS commonGeneres
+        WHERE commonGeneres > 0
+        RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year
+        LIMIT 10
+    """
+    return run_query(q, {"id": movie_id})
+
+def recommend_by_company(movie_id):
+    q = """
+        MATCH (m:Movie {id: $id})-[:PRODUCED_BY]->(c:Company)
+        WITH m, collect(DISTINCT c) AS companies
+
+        MATCH (rec:Movie)-[:PRODUCED_BY]->(rc:Company)
+        WHERE rec <> m
+        WITH m, rec, companies, collect(DISTINCT rc) AS recComp
+        WITH m, rec, size([x IN recComp WHERE x IN companies]) AS commonComp
+        WHERE commonComp > 0
+        RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year
+        ORDER BY commonComp DESC
+        LIMIT 10
+    """
+    return run_query(q, {"id": movie_id})
+
+
+# ==========================================================
+# =============  Widgets & Layout func calls ===============
+# ==========================================================
+
+@st.dialog(title="Movie Details", width="medium")
 def page_details(movie: Dict[str, Any]):
     with st.spinner("Loading movie details..."):
         movie = get_movie_details(movie["id"])
     st.title(movie["title"])
-    left, right = st.columns([3, 1])
-    left.image(get_image_url(movie["poster_url"]), width=300)
+    left, right = st.columns([4, 2])
+    left.image(get_image_url(movie["poster_url"]))
     with right.container():
         with st.container(horizontal=True):
             st.markdown(f"**Released:** {movie.get("release_date", date(1,1,1)).strftime("%d/%m/%Y")}")
             # st.write()
             st.markdown(f"⭐ ({movie.get("rating", 0)}/10)")
-        watched = movie['id'] in st.session_state.get("watch_history", [])
-        if st.button("Watch", icon=":material/play_arrow:" if not watched else ":material/check_circle:", 
-                    key=f"watch_{movie['id']}", help="Watch Movie" if not watched else "Already Watched"):
-            watched = True
-            watch_movie(movie)
+            st.markdown(f"**Popularity:** {movie["popularity"]}")
+        # history = st.session_state.get("watch_history", [])
+        current_user = st.session_state.get("selected_user", {"id":0})
+        if current_user:
+            history = [m["id"] for m in get_user_watch_history(current_user["id"])]
+        else:
+            history = []
+        watched = movie['id'] in history
+        with st.container(horizontal=True):
+            if st.button("Watch", icon=":material/play_arrow:" if not watched else ":material/check_circle:", 
+                        key=f"watch_{movie['id']}", help="Watch Movie" if not watched else "Already Watched"):
+                watched = True
+                watch_movie(movie)
+            if st.button("Get Recommendation"):
+                st.query_params.recommend = movie["id"]
+                st.rerun()
 
     st.markdown("### Overview")
     st.write(movie["overview"])
@@ -153,25 +232,29 @@ def movie_list_section(title: str, movie_subset: List[Dict[str, Any]], show_refr
                 if st.button(
                     "Show Details",
                     help=movie["title"],
+                    key=f"{title.replace(' ', '_')}_details_{movie["id"]}"
                 ):
                     page_details(movie)
+        if not movie_subset:
+            st.write("EMPTY")
 
 # --------------------- HOME PAGE ---------------------
+def home_page():
+    
+    st.title("🎬 Streamflix Movies")
+
+    random_movies = get_random_movies()
+    movie_list_section("Random Movies", random_movies, show_refresh_button=True, refresh_action=lambda: get_random_movies.clear() and st.rerun())
+
+    popular_movies = get_popular_movies()
+    movie_list_section("Popular Movies", popular_movies)
+
+    if (user:=st.session_state.get("selected_user")):
+        history = get_user_watch_history(user["id"])
+        movie_list_section(f"Watch History for {user["name"]}", history)
+
+
 st.set_page_config(layout="wide")
-st.title("🎬 Streamflix Movies")
-
-random_movies = get_random_movies()
-
-movie_list_section("Random Movies", random_movies, show_refresh_button=True, refresh_action=lambda: get_random_movies.clear() and st.rerun())
-
-consistent_movie_query = """
-MATCH (m:Movie)
-RETURN m.id AS id, m.title AS title, m.poster_url AS poster_url, m.release_date.year AS release_year
-LIMIT 10
-"""
-
-consistent_movies = run_query(consistent_movie_query)
-movie_list_section("Movies", consistent_movies)
 
 # for user account selection
 with st.sidebar:
@@ -186,10 +269,7 @@ with st.sidebar:
         st.write(f"Logged in as **_{selected_user['name']}_** `id: {selected_user['id']}`")
     
         st.session_state["selected_user"] = selected_user
-        history = run_query("""
-                            MATCH (u:User {id: $user_id}) -[a:WATCHED]-> (m:Movie)
-                            RETURN COLLECT(DISTINCT m.id) as watchlist
-                            """, {"user_id": selected_user["id"]})[0]["watchlist"]
+        history = get_user_watch_history(selected_user["id"])
         st.session_state["watch_history"] = history
     else:
         st.session_state["selected_user"] = None
@@ -197,4 +277,26 @@ with st.sidebar:
         st.warning("Please select a user account to track your watch history.")
 
     st.markdown("---")
+
+
+# Navigation logic
+if st.query_params.get("recommend"): # recommendation page
+    if st.button("<-"):
+        st.query_params.clear()
+        st.rerun()
+    movie_id = int(st.query_params.recommend)
+    movie_title = run_query("MATCH (m:Movie {id: $id}) RETURN m.title as t", {"id": movie_id})[0]['t']
+
+    # keyword
+    movie_list_section(f"Similar Keywords to `{movie_title}`",
+                       recommend_by_keyword(movie_id))
+    # genre
+    movie_list_section(f"Similar Genre to `{movie_title}`",
+                       recommend_by_genre(movie_id))
+    # company
+    movie_list_section(f"Produced by the same Company as `{movie_title}`",
+                       recommend_by_company(movie_id))
+
     
+else:
+    home_page()
