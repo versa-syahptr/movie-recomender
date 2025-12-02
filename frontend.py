@@ -107,20 +107,11 @@ def get_user_watch_history(user_id: str) -> List[str]:
     return []
 
 # ==========================================================
-# =============  Recommendations func calls  ===============
+# =============  Recommendation query calls  ===============
 # ==========================================================
 
-def get_popular_movies():
-    query = """
-            MATCH (m:Movie)
-            RETURN m.id AS id, m.title AS title, m.poster_url AS poster_url, m.release_date.year AS release_year
-            ORDER BY m.popularity DESC
-            LIMIT 10;
-    """
-    return run_query(query)
-
-def recommend_by_keyword(movie_id):
-    q = """
+class Recommender:
+    keyword = """
         MATCH (m:Movie {id: $id})-[:HAS_KEYWORD]->(k:Keyword)
         WITH m, collect(DISTINCT k) AS keywords
 
@@ -130,13 +121,9 @@ def recommend_by_keyword(movie_id):
         WITH m, rec, size([x IN recKeywords WHERE x IN keywords]) AS commonKeywords
         WHERE commonKeywords > 0
         RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year
-        LIMIT 10
+        LIMIT $limit
     """
-    
-    return run_query(q, {"id": movie_id})
-
-def recommend_by_genre(movie_id):
-    q = """
+    genre = """
         MATCH (m:Movie {title: "Avatar"})-[hg:HAS_GENRE]->(g:Genre)
         WITH m, collect(DISTINCT g) AS genres
 
@@ -146,12 +133,9 @@ def recommend_by_genre(movie_id):
         WITH m, rec, size([x IN recGenres WHERE x IN genres]) AS commonGeneres
         WHERE commonGeneres > 0
         RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year
-        LIMIT 10
+        LIMIT $limit
     """
-    return run_query(q, {"id": movie_id})
-
-def recommend_by_company(movie_id):
-    q = """
+    company = """
         MATCH (m:Movie {id: $id})-[:PRODUCED_BY]->(c:Company)
         WITH m, collect(DISTINCT c) AS companies
 
@@ -162,9 +146,64 @@ def recommend_by_company(movie_id):
         WHERE commonComp > 0
         RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year
         ORDER BY commonComp DESC
-        LIMIT 10
+        LIMIT $limit
     """
-    return run_query(q, {"id": movie_id})
+    cast = """
+        MATCH (m:Movie {id: $id})<-[:CASTED_IN]-(p:Person)
+        WITH m, collect(DISTINCT p) AS people
+
+        MATCH (rec:Movie)<-[:CASTED_IN]-(rp:Person)
+        WHERE rec <> m
+        WITH m, rec, people, collect(DISTINCT rp) AS recPerson
+        WITH m, rec, size([x IN recPerson WHERE x IN people]) AS commonCast
+        WHERE commonCast > 0
+        RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year
+        ORDER BY commonCast DESC
+        LIMIT $limit
+    """
+    director = """
+        MATCH (m:Movie {id: $id})
+        MATCH (p:Person)-[d:WORKED_IN {job: "Director"}]->(m)
+        MATCH (p)-[d2:WORKED_IN {job: "Director"}]->(rec:Movie)
+        WHERE rec <> m
+
+        RETURN rec.id AS id, rec.title AS title, rec.poster_url AS poster_url, rec.release_date.year AS release_year, p.name as director
+        ORDER BY rec.popularity DESC
+        LIMIT $limit;
+    """
+
+    def __init__(self, movie_id: int, limit: int):
+        self.movie_id = movie_id
+        self.limit = limit
+
+    def get(self, name):
+        q = getattr(self, name)
+        return run_query(q, {"id": self.movie_id, "limit": self.limit})
+
+def get_popular_movies(limit=10):
+    query = """
+            MATCH (m:Movie)
+            RETURN m.id AS id, m.title AS title, m.poster_url AS poster_url, m.release_date.year AS release_year
+            ORDER BY m.popularity DESC
+            LIMIT $limit;
+    """
+    return run_query(query, {"limit": limit})
+
+def get_colaborative_recommendation(uid, limit=10):
+    q = """
+        MATCH (u1:User {id: $uid})
+        MATCH (u1)-[:WATCHED]->(:Movie)-[:HAS_KEYWORD]->(k:Keyword)
+        MATCH (u2:User)-[:WATCHED]->(:Movie)-[:HAS_KEYWORD]->(k)
+        WHERE u2 <> u1
+        MATCH (u2)-[:WATCHED]->(rec:Movie)
+        WHERE NOT (u1)-[:WATCHED]->(rec)
+
+        RETURN rec.id as id, rec.title as title, rec.popularity as popularity, rec.poster_url AS poster_url, 
+               rec.release_date.year AS release_year, COUNT(DISTINCT k) AS shared_kwds
+        ORDER BY shared_kwds DESC, popularity DESC
+        LIMIT $limit;
+    """
+    return run_query(q, {"uid": uid, "limit": limit})
 
 
 # ==========================================================
@@ -241,15 +280,17 @@ def movie_list_section(title: str, movie_subset: List[Dict[str, Any]], show_refr
 # --------------------- HOME PAGE ---------------------
 def home_page():
     
-    st.title("🎬 Streamflix Movies")
+    st.title("🎬 NeoStreamFlix Movies")
 
     random_movies = get_random_movies()
     movie_list_section("Random Movies", random_movies, show_refresh_button=True, refresh_action=lambda: get_random_movies.clear() and st.rerun())
 
-    popular_movies = get_popular_movies()
+    popular_movies = get_popular_movies(limit)
     movie_list_section("Popular Movies", popular_movies)
 
     if (user:=st.session_state.get("selected_user")):
+        colab_rec = get_colaborative_recommendation(user["id"], limit)
+        movie_list_section(f"Users with Similar Interests Also Watched", colab_rec)
         history = get_user_watch_history(user["id"])
         movie_list_section(f"Watch History for {user["name"]}", history)
 
@@ -277,6 +318,8 @@ with st.sidebar:
         st.warning("Please select a user account to track your watch history.")
 
     st.markdown("---")
+    limit = st.sidebar.slider("Recommendation Limit", min_value=1, max_value=50, value=10)
+
 
 
 # Navigation logic
@@ -286,17 +329,25 @@ if st.query_params.get("recommend"): # recommendation page
         st.rerun()
     movie_id = int(st.query_params.recommend)
     movie_title = run_query("MATCH (m:Movie {id: $id}) RETURN m.title as t", {"id": movie_id})[0]['t']
+    recommender = Recommender(movie_id, limit)
 
     # keyword
     movie_list_section(f"Similar Keywords to `{movie_title}`",
-                       recommend_by_keyword(movie_id))
+                       recommender.get("keyword"))
     # genre
     movie_list_section(f"Similar Genre to `{movie_title}`",
-                       recommend_by_genre(movie_id))
+                       recommender.get("genre"))
     # company
     movie_list_section(f"Produced by the same Company as `{movie_title}`",
-                       recommend_by_company(movie_id))
+                       recommender.get("company"))
+    # casts
+    movie_list_section(f"Shared the same Cast as `{movie_title}`",
+                       recommender.get("cast"))
+    #director
+    recommend_by_director = recommender.get("director")
+    director_name = recommend_by_director[0]["director"]
+    movie_list_section(f"Also directed by `{director_name}`", recommend_by_director)
 
-    
-else:
-    home_page()
+    st.stop()
+
+home_page()
